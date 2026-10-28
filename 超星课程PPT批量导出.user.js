@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星/学习通 课程 PPT 批量导出
 // @namespace    https://local.reasonix/chaoxing-ppt-export
-// @version      1.0.0
+// @version      1.1.0
 // @description  一键扫描当前课程所有章节的课件（PPT/PDF/Word 等），批量下载原文件。适用超星 mooc1 学生学习页面。
 // @author       大肥鱼
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -9,7 +9,11 @@
 // @match        *://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentstudy*
 // @match        *://*.chaoxing.com/*studentstudy*
 // @grant        GM_download
+// @grant        GM_xmlhttpRequest
 // @connect      *
+// @connect      chaoxing.com
+// @connect      cldisk.com
+// @connect      ananas.chaoxing.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -58,6 +62,15 @@
     if (location.protocol === 'https:' && url.startsWith('http:')) return 'https:' + url.slice(5);
     if (location.protocol === 'http:' && url.startsWith('https:')) return 'http:' + url.slice(6);
     return url;
+  }
+
+  // 统一成可用的绝对地址（//host/xx、/relative 都补齐）
+  function normalizeUrl(url) {
+    if (!url) return url;
+    let u = String(url).trim();
+    if (u.startsWith('//')) u = location.protocol + u;
+    else if (u.startsWith('/')) u = location.origin + u;
+    return fixProtocol(u);
   }
 
   // 从超星那种“类 JS 对象”文本里取字符串字段（key 可能带引号也可能不带）
@@ -161,6 +174,13 @@
     return DOC_EXTS.includes(ext);
   }
 
+  // 从 cards 页面里顺手捡一个 fid（部分接口的 ?k= 参数要用）
+  function captureFid(html) {
+    if (st.fid) return;
+    const m = html.match(/"fid"\s*:\s*"?(\d{2,8})"?/);
+    if (m) st.fid = m[1];
+  }
+
   function isPpt(ext, name) {
     if (['.ppt', '.pptx', '.pps', '.ppsx', '.pot', '.potx'].includes(ext)) return true;
     return /\.(ppt|pptx|pps|ppsx|pot|potx)$/i.test(String(name || ''));
@@ -176,7 +196,8 @@
       if (!/^[0-9a-f]{32}$/.test(oid) || map.has(oid)) return;
       const name = o.name || '';
       const ext = normalizeExt(o.type, name);
-      if (!isDocType(ext) && !name) return;      // 既没类型又没名字的，跳过
+      if (ext && !isDocType(ext)) return;       // 视频/图片等非文档附件直接跳过
+      if (!ext && !name) return;                // 既没类型又没名字的，跳过
       map.set(oid, {
         objectid: oid,
         name: name,
@@ -217,6 +238,7 @@
         if (!html || html.length < 200) continue;
         okBase = base;
         collectAttachments(html, map);
+        captureFid(html);
         if (!sawImg && /insertimg/i.test(html)) sawImg = true;
         break;
       }
@@ -229,22 +251,49 @@
   }
 
   /* ============================ 下载 ============================ */
-  async function ananasStatus(objectid) {
-    const bases = [location.origin, 'https://mooc1.chaoxing.com'];
-    let lastErr = '';
+  // 取原文件直链：/ananas/status/{objectid}?flag=normal（返回 {status:"success",download:"…",filename:"…"}）
+  // 多试几种参数组合，失败时把每一步的响应片段带在 err.trace 里，方便诊断
+  async function ananasStatus(objectid, verbose) {
+    const bases = Array.from(new Set([location.origin, 'https://mooc1.chaoxing.com', 'https://mooc2-ans.chaoxing.com']));
+    const paths = [
+      '/ananas/status/' + objectid + '?flag=normal',
+      '/ananas/status/' + objectid + '?download=1&flag=normal',
+      '/mooc-ans/ananas/status/' + objectid + '?flag=normal',
+    ];
+    if (st.fid) paths.splice(1, 0, '/ananas/status/' + objectid + '?k=' + st.fid + '&flag=normal');
+
+    const trace = [];
     for (const b of bases) {
-      try {
-        const r = await fetch(b + '/ananas/status/' + objectid + '?flag=normal', { credentials: 'include' });
-        if (!r.ok) { lastErr = 'HTTP ' + r.status; continue; }
-        const t = await r.text();
+      for (const p of paths) {
+        let res;
+        const url = b + p;
+        try {
+          res = await fetch(url, {
+            credentials: 'include',
+            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+          });
+        } catch (e) {
+          trace.push('网络错误 ' + url + ' → ' + e.message);
+          continue;
+        }
+        if (!res.ok) { trace.push('HTTP ' + res.status + ' ' + url); continue; }
+        const t = await res.text();
+        if (t.length > 4000000) { trace.push('响应过大 ' + url); continue; }
+        const download = pickField(t, 'download') || pickField(t, 'downloadUrl') || pickField(t, 'url');
         const status = pickField(t, 'status');
-        const download = pickField(t, 'download');
         const filename = pickField(t, 'filename');
-        if (download) return { status: status || 'success', download: fixProtocol(download), filename };
-        lastErr = 'status=' + (status || '空');
-      } catch (e) { lastErr = e.message; }
+        if (download) {
+          const f = t.match(/"fid"\s*:\s*"?(\d{2,8})"?/);
+          if (f && !st.fid) st.fid = f[1];
+          return { status: status || 'success', download: normalizeUrl(download), filename };
+        }
+        trace.push('status=' + (status || '空') + ' ' + url + ' ← ' + t.slice(0, 160).replace(/\s+/g, ' '));
+      }
     }
-    throw new Error(lastErr || '取下载地址失败');
+    const err = new Error(trace.length ? trace[trace.length - 1] : '取下载地址失败');
+    err.trace = trace;
+    if (verbose) console.warn('[超星PPT导出] status 诊断\n' + trace.join('\n'));
+    throw err;
   }
 
   function buildFileName(ch, att, serverName) {
@@ -255,30 +304,78 @@
     return sanitizeName(prefix + base);
   }
 
+  // 一级：GM_download（走浏览器下载器，跨域 + 自动带 Cookie）
   function gmDownload(url, name) {
     return new Promise((resolve) => {
-      if (typeof GM_download === 'function') {
-        let settled = false;
-        const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
-        try {
-          GM_download({
-            url: url,
-            name: name,
-            saveAs: false,
-            conflictAction: 'uniquify',
-            onload: () => finish('ok'),
-            onerror: (e) => finish('err:' + ((e && (e.error || e.message)) || '下载失败')),
-            ontimeout: () => finish('err:超时'),
-          });
-        } catch (e) { finish('err:' + e.message); }
-      } else {
-        const a = el('a', { href: url, download: name, target: '_blank', style: 'display:none' });
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        resolve('ok');
-      }
+      if (typeof GM_download !== 'function') return resolve('err:无 GM_download');
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      try {
+        GM_download({
+          url: url,
+          name: name,
+          saveAs: false,
+          conflictAction: 'uniquify',
+          onload: () => finish('ok'),
+          onerror: (e) => finish('err:' + ((e && (e.error || e.message)) || '下载失败')),
+          ontimeout: () => finish('err:超时'),
+        });
+      } catch (e) { finish('err:' + e.message); }
     });
+  }
+
+  // 二级：GM_xmlhttpRequest 取 blob 再落盘（绕开 CORS / 白名单限制）
+  function gmXhrDownload(url, name) {
+    return new Promise((resolve) => {
+      if (typeof GM_xmlhttpRequest !== 'function') return resolve('err:无 GM_xmlhttpRequest');
+      try {
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: url,
+          responseType: 'blob',
+          timeout: 120000,
+          headers: { Referer: location.href },
+          onload: (r) => {
+            if (r.status !== 200 || !r.response) return resolve('err:HTTP ' + r.status);
+            const blobUrl = URL.createObjectURL(r.response);
+            const a = el('a', { href: blobUrl, download: name, style: 'display:none' });
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+            resolve('ok');
+          },
+          onerror: () => resolve('err:xhr 请求失败'),
+          ontimeout: () => resolve('err:xhr 超时'),
+        });
+      } catch (e) { resolve('err:' + e.message); }
+    });
+  }
+
+  // 三级：直接 a[download]（最朴素，跨域时 download 属性可能被忽略，只算“已发起”）
+  function anchorDownload(url, name) {
+    try {
+      const a = el('a', { href: url, download: name, target: '_blank', style: 'display:none' });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return 'weak';
+    } catch (e) { return 'err:' + e.message; }
+  }
+
+  // 依次降级，返回实际生效的方式；全挂才抛错
+  async function saveFile(url, name) {
+    const fails = [];
+    let r = await gmDownload(url, name);
+    if (r === 'ok') return 'GM_download';
+    fails.push('GM_download → ' + r);
+    r = await gmXhrDownload(url, name);
+    if (r === 'ok') return 'GM_xhr';
+    fails.push('GM_xhr → ' + r);
+    r = anchorDownload(url, name);
+    if (r === 'weak') return 'anchor(未确认)';
+    fails.push('链接跳转 → ' + r);
+    throw new Error(fails.join('；'));
   }
 
   /* ============================ 界面 ============================ */
@@ -291,6 +388,8 @@
     onlyPpt: true,
     busy: false,
     scannedAt: 0,
+    fid: '',
+    errors: [],
   };
 
   let ui = null;
@@ -302,6 +401,7 @@
       localStorage.setItem(cacheKey(), JSON.stringify({
         ts: Date.now(),
         courseName: st.courseName,
+        fid: st.fid,
         chapters: st.chapters,
         downloaded: Array.from(st.downloaded),
       }));
@@ -316,16 +416,21 @@
       if (!d || !Array.isArray(d.chapters)) return false;
       st.chapters = d.chapters;
       st.courseName = d.courseName || st.courseName;
+      st.fid = d.fid || '';
       st.scannedAt = d.ts || 0;
       st.downloaded = new Set(d.downloaded || []);
       return true;
     } catch (e) { return false; }
   }
 
-  function toast(msg) {
+  function logLine(msg) {
     if (!ui) return;
-    ui.log.textContent = msg;
+    ui.logBuf = (ui.logBuf || []).concat(String(msg)).slice(-80);
+    ui.log.textContent = ui.logBuf.join('\n');
+    ui.log.scrollTop = ui.log.scrollHeight;
   }
+
+  function toast(msg) { logLine(msg); }
 
   function setStatus(msg) { if (ui && ui.status) ui.status.textContent = msg; }
 
@@ -432,8 +537,9 @@
     const btnDownload = el('button', { class: 'cxp-btn cxp-primary', text: '下载选中（0）' });
     const btnCopy = el('button', { class: 'cxp-btn', text: '复制清单' });
     const btnJson = el('button', { class: 'cxp-btn', text: '导出清单' });
+    const btnDiag = el('button', { class: 'cxp-btn', text: '诊断' });
     const btnClear = el('button', { class: 'cxp-btn', text: '重置下载记录' });
-    bar2.append(btnDownload, btnCopy, btnJson, btnClear);
+    bar2.append(btnDownload, btnCopy, btnJson, btnDiag, btnClear);
 
     const status = el('div', { class: 'cxp-status', text: '就绪' });
     const list = el('div', { class: 'cxp-list' });
@@ -470,6 +576,8 @@
     });
 
     btnDownload.addEventListener('click', runDownloads);
+
+    btnDiag.addEventListener('click', diagnose);
 
     btnCopy.addEventListener('click', () => {
       const lines = [];
@@ -530,6 +638,7 @@
     #cxppt-panel .cxp-item{display:flex;gap:5px;align-items:center;padding:2px 4px 2px 10px;border-radius:4px;cursor:pointer}
     #cxppt-panel .cxp-item:hover{background:#2a313a}
     #cxppt-panel .cxp-item.cxp-done .cxp-name{color:#7ec87e}
+    #cxppt-panel .cxp-item.cxp-err .cxp-name{color:#ff8f8f}
     #cxppt-panel .cxp-item input{margin:0;flex:0 0 auto}
     #cxppt-panel .cxp-tag{flex:0 0 auto;padding:0 4px;border-radius:3px;background:#3a4048;color:#aab6c4;font-size:11px}
     #cxppt-panel .cxp-tag.cxp-ppt{background:#1d4ed8;color:#fff}
@@ -538,7 +647,7 @@
     #cxppt-panel .cxp-open{flex:0 0 auto;border:none;background:transparent;color:#6ea8ff;cursor:pointer;font-size:12px;padding:0 2px}
     #cxppt-panel .cxp-none{color:#6c7783;padding:0 0 2px 12px}
     #cxppt-panel .cxp-empty{color:#8794a3;padding:10px 0}
-    #cxppt-panel .cxp-log{color:#e0b25a;min-height:14px;word-break:break-all;font-size:11px}
+    #cxppt-panel .cxp-log{color:#e0b25a;min-height:14px;word-break:break-all;font-size:11px;white-space:pre-wrap;max-height:110px;overflow:auto}
     `;
     document.head.appendChild(el('style', { text: css }));
     document.body.appendChild(panel);
@@ -611,9 +720,10 @@
     if (!items.length) { toast('没有选中任何文件'); return; }
 
     st.busy = true;
+    st.errors = [];
     refreshSummary();
     const queue = items.slice();
-    let done = 0, ok = 0, fail = 0;
+    let done = 0, ok = 0, weak = 0, fail = 0;
 
     const worker = async () => {
       while (queue.length) {
@@ -623,15 +733,17 @@
         try {
           const info = await ananasStatus(it.att.objectid);
           const name = buildFileName(it.ch, it.att, info.filename);
-          const r = await gmDownload(info.download, name);
-          if (r !== 'ok') throw new Error(r);
-          ok++;
+          const via = await saveFile(info.download, name);
+          if (via.startsWith('anchor')) weak++; else ok++;
           st.downloaded.add(it.att.objectid);
-          markItem(it.att.objectid, 'ok');
+          markItem(it.att.objectid, 'ok', via);
         } catch (e) {
           fail++;
-          markItem(it.att.objectid, 'err');
-          toast(`失败：${it.att.name || it.att.objectid} —— ${e.message || e}`);
+          const why = e.message || String(e);
+          markItem(it.att.objectid, 'err', why);
+          logLine(`✗ ${it.ch.sbar} ${it.att.name || it.att.objectid} —— ${why}`);
+          if (e.trace) e.trace.forEach((line) => logLine('   ' + line));
+          st.errors.push(`${it.ch.sbar}\t${it.att.name}\t${why}`);
         }
         saveCache();
         await sleep(CFG.statusDelay);
@@ -641,20 +753,52 @@
     await Promise.all(Array.from({ length: Math.max(1, CFG.parallel) }, worker));
     st.busy = false;
     refreshSummary();
-    setStatus(`下载结束：成功 ${ok}，失败 ${fail}`);
-    if (fail) toast(`有 ${fail} 个失败，可点每行的 ↗ 手动下载`);
+    setStatus(`下载结束：成功 ${ok}${weak ? `（另有 ${weak} 个仅发起、未确认）` : ''}，失败 ${fail}`);
+    if (fail) logLine(`有 ${fail} 个失败，点「诊断」看详细原因，或点每行 ↗ 手动下载`);
   }
 
-  function markItem(oid, cls) {
+  function markItem(oid, cls, msg) {
     if (!ui) return;
     const node = ui.list.querySelector(`.cxp-item[data-oid="${oid}"]`);
     if (!node) return;
-    if (cls === 'ok') node.classList.add('cxp-done');
-    else {
+    const meta = node.querySelector('.cxp-meta');
+    if (cls === 'ok') {
+      node.classList.add('cxp-done');
+      if (meta && msg) meta.textContent = msg;
+    } else {
       node.classList.add('cxp-err');
-      const tag = node.querySelector('.cxp-meta');
-      if (tag) tag.textContent = '失败';
+      node.title = msg || '下载失败';
+      if (meta) meta.textContent = '失败';
     }
+  }
+
+  // 诊断：对第一个选中（或第一个）附件跑一遍“取直链 + 下载”，把每一步结果摊开
+  async function diagnose() {
+    const sel = selectedItems();
+    let att = sel.length ? sel[0].att : null;
+    if (!att) {
+      for (const ch of st.chapters) {
+        if ((ch.attachments || []).length) { att = ch.attachments[0]; break; }
+      }
+    }
+    if (!att) { logLine('先「扫描全部章节」，再点诊断'); return; }
+
+    setStatus('诊断中…');
+    logLine('—— 诊断开始 ——');
+    logLine('objectid: ' + att.objectid + '   fid: ' + (st.fid || '未取到') + '   页面: ' + location.href);
+    try {
+      const info = await ananasStatus(att.objectid, true);
+      logLine('✓ status 正常，直链：' + info.download);
+      const via = await saveFile(info.download, '诊断_' + (att.name || att.objectid));
+      logLine('✓ 保存方式：' + via);
+      setStatus('诊断通过：接口和下载都正常');
+    } catch (e) {
+      logLine('✗ ' + (e.message || String(e)));
+      (e.trace || []).forEach((l) => logLine('   ' + l));
+      console.warn('[超星PPT导出] 诊断失败', e);
+      setStatus('诊断失败，详情见下方日志');
+    }
+    copyText(ui.log.textContent);
   }
 
   function init() {
@@ -678,7 +822,7 @@
 
   // 调试用：在控制台写 window.__CXPPT_DEBUG__ = true 后刷新，可拿到内部函数自测
   if (window.__CXPPT_DEBUG__) {
-    window.__cxpptInternals = { collectAttachments, cardsUrl, pickField, readChapters, st };
+    window.__cxpptInternals = { collectAttachments, cardsUrl, pickField, readChapters, normalizeUrl, buildFileName, st };
   }
 
   // 章节树可能是异步渲染的，轮询等它出现

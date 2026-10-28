@@ -15,7 +15,7 @@
 
 1. 点「扫描全部章节」——脚本会逐章请求 `knowledge/cards` 页面，抽出每章插入的课件（PPT/PDF/Word…）；
 2. 列表默认**只显示 PPT 且已全选**（关掉「仅PPT」可看到 PDF/Word 等附件）；
-3. 点「下载选中」，等进度跑完即可；单章文件失败时点该行的 `↗` 可手动下载；
+3. 点「下载选中」，等进度跑完即可；某个文件失败时点该行的 `↗` 可手动下载，或点「诊断」看具体原因；
 4. 「复制清单 / 导出清单」可留存一份章节↔课件对照表（TSV / JSON）。
 
 扫描结果按 `courseId` 缓存在 `localStorage`，下次进页面不用重扫；换课程或课件更新时点「扫描全部章节」刷新。
@@ -27,7 +27,21 @@
 | 章节列表 | DOM `#coursetree .posCatalog_select[id^=cur]` | `id` 去掉 `cur` 就是 `knowledgeId` |
 | 章节课件 | `/mooc-ans/knowledge/cards?clazzid=&courseid=&knowledgeid=&num=…` | 返回 HTML，解析 `iframe[insertdoc]` 的 `data` JSON（含 `objectid`、`name`、`type`、`size`） |
 | 下载地址 | `/ananas/status/{objectid}?flag=normal` | 返回 `{status:"success",download:"…",filename:"…"}`，`download` 即原文件直链 |
-| 落盘 | `GM_download`（跨域、带 Cookie） | 文件名 = `章节号_章节名__原文件名` |
+| 落盘 | `GM_download` → `GM_xmlhttpRequest`(blob) → `a[download]` 逐级降级 | 文件名 = `章节号_章节名__原文件名`；直链形如 `https://d0.cldisk.com/download/{objectid}?at_=…&ak_=…&ad_=…`（带签名、有时效） |
+
+## 下载全部失败怎么办
+
+先点面板里的「诊断」：它会对第一个附件跑一遍「取直链 + 下载」，把每一步的 HTTP 状态和响应片段写进日志（并自动复制到剪贴板）。按日志对号入座：
+
+| 日志里看到 | 含义 / 处理 |
+| --- | --- |
+| `HTTP 302` / 响应片段是 login 页 | 登录态失效，重新登录学习通后再点扫描 |
+| `status=err` / `status=fail` | 老师关闭了该附件的下载权限，拿不到原文件 |
+| `GM_download → not_whitelisted` | 油猴 `@connect` 未生效；脚本已自动降级到 `GM_xhr` / `a[download]`，若都失败请更新油猴版本 |
+| `GM_xhr → HTTP 403` | CDN 拒绝（签名过期/防盗链），重扫一遍再下 |
+| 全部 `网络错误` | 页面 CSP 或网络拦截了 `fetch`，可先关掉其它同类脚本再试 |
+
+「诊断」通过但批量仍失败时，多半是短时间请求太密被限流——把 `CFG.parallel` 调到 1、`statusDelay` 调到 500 再试。
 
 ## 已知限制
 

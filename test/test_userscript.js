@@ -67,4 +67,11 @@ if (api.pickField(statusText, 'download') !== 'http://p.ananas.chaoxing.com/star
 api.st.params = { courseId: '268592729', clazzId: '158343203', cpi: '410093475' };
 console.log('cardsUrl ->', api.cardsUrl('/mooc-ans', '1273611702', 0));
 
+// 5. 校验直链归一化 + 文件名
+console.log('normalizeUrl ->', api.normalizeUrl('//d0.cldisk.com/download/x?y=1'), '|', api.normalizeUrl('/ananas/status/x'));
+if (api.normalizeUrl('//d0.cldisk.com/a') !== 'https://d0.cldisk.com/a') { console.error('FAIL: // 归一化'); process.exit(1); }
+const fname = api.buildFileName({ sbar: '1.2', title: '算法及其分析' }, { name: '第2讲(1).pptx', ext: '.pptx' }, '');
+console.log('fileName ->', fname);
+if (!fname.endsWith('.pptx') || fname.includes('/')) { console.error('FAIL: 文件名'); process.exit(1); }
+
 console.log('ALL OK');
