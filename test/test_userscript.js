@@ -1,0 +1,70 @@
+// 自测：在 Node 里用假 DOM 加载油猴脚本，用保存的页面快照验证解析逻辑。
+// 用法（仓库根目录）：node test/test_userscript.js
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const root = path.join(__dirname, '..');
+const code = fs.readFileSync(path.join(root, '超星课程PPT批量导出.user.js'), 'utf8');
+const html = fs.readFileSync(path.join(root, '学生学习页面_files', 'cards.html'), 'utf8');
+
+const noopEl = () => ({
+  appendChild() {}, append() {}, setAttribute() {}, addEventListener() {},
+  classList: { toggle() {}, add() {} }, style: {}, querySelector: () => null, textContent: '',
+});
+const document = {
+  scripts: [],
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  getElementById: () => null,
+  createElement: () => noopEl(),
+  body: { appendChild() {} },
+  head: { appendChild() {} },
+};
+const window = { __CXPPT_DEBUG__: true };
+const location = {
+  search: '?chapterId=1&courseId=268592729&clazzid=158343203&cpi=410093475',
+  origin: 'https://mooc1.chaoxing.com',
+  protocol: 'https:',
+};
+const localStorage = { getItem: () => null, setItem() {} };
+
+const ctx = {
+  window, document, location, localStorage,
+  navigator: {}, console,
+  setInterval: () => 0, clearInterval: () => {}, setTimeout,
+  fetch: () => Promise.reject(new Error('no net')),
+  URL, URLSearchParams, Blob: function () {}, JSON, Promise, RegExp,
+  Math, Date, String, Number, Array, Set, Map, Object,
+};
+ctx.globalThis = ctx;
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+
+const api = ctx.window.__cxpptInternals;
+if (!api) { console.error('FAIL: 没拿到内部函数'); process.exit(1); }
+
+// 1. 解析 cards.html 里的 PPT 附件
+const map = new Map();
+api.collectAttachments(html, map);
+const list = [...map.values()];
+console.log('解析到附件数:', list.length);
+list.forEach((a) => console.log(' -', a.objectid, '|', a.name, '|', a.ext, '| isPpt=', a.isPpt, '| size=', a.size));
+
+// 2. 校验关键字段
+const ppt = list.find((a) => a.objectid === '3a70acbf3b908d29cb389e8567c57592');
+if (!ppt) { console.error('FAIL: 没解析出 objectid'); process.exit(1); }
+if (ppt.name !== '第2讲(1).pptx') { console.error('FAIL: 文件名不对 ->', ppt.name); process.exit(1); }
+if (!ppt.isPpt) { console.error('FAIL: 未识别为 PPT'); process.exit(1); }
+
+// 3. 校验 status 返回解析（类 JS 对象，键不带引号）
+const statusText = '{status:"success",download:"http://p.ananas.chaoxing.com/star3/origin/abc.pptx?x=1",filename:"第2讲.pptx",length:710673}';
+console.log('status ->', api.pickField(statusText, 'status'), '|', api.pickField(statusText, 'download'), '|', api.pickField(statusText, 'filename'));
+if (api.pickField(statusText, 'status') !== 'success') { console.error('FAIL: status 解析'); process.exit(1); }
+if (api.pickField(statusText, 'download') !== 'http://p.ananas.chaoxing.com/star3/origin/abc.pptx?x=1') { console.error('FAIL: download 解析'); process.exit(1); }
+
+// 4. 校验 cardsUrl
+api.st.params = { courseId: '268592729', clazzId: '158343203', cpi: '410093475' };
+console.log('cardsUrl ->', api.cardsUrl('/mooc-ans', '1273611702', 0));
+
+console.log('ALL OK');

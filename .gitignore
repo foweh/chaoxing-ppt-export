@@ -1,0 +1,8 @@
+# 保存的超星页面快照（4MB+ 的 HTML 和一堆 js/css/png，不入库）
+学生学习页面.html
+学生学习页面_files/
+
+# 临时脚本 / 系统垃圾
+.tmp/
+Thumbs.db
+desktop.ini
