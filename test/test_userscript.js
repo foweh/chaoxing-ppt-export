@@ -83,4 +83,9 @@ const fname = api.buildFileName({ sbar: '1.2', title: '算法及其分析' }, { 
 console.log('fileName ->', fname);
 if (!fname.endsWith('.pptx') || fname.includes('/')) { console.error('FAIL: 文件名'); process.exit(1); }
 
+// 6. 校验签名时间解析
+const at = api.atTime('http://d0.cldisk.com/download/x?at_=1793166438414&ak=c9ad&ad=109f');
+console.log('atTime ->', at, new Date(at).toISOString());
+if (at !== 1793166438414) { console.error('FAIL: at_ 解析'); process.exit(1); }
+
 console.log('ALL OK');

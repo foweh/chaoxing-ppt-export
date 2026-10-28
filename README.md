@@ -39,9 +39,12 @@
 | `status=err` / `status=fail` | 老师关闭了该附件的下载权限，拿不到原文件 |
 | `GM_download → not_whitelisted` | 油猴 `@connect` 未生效；脚本已自动降级到 `GM_xhr` / `a[download]`，若都失败请更新油猴版本 |
 | `GM_xhr → HTTP 403` | CDN 拒绝（签名过期/防盗链），重扫一遍再下 |
+| 下载下来是 `403 Forbidden` 的 `.htm` 页 | 签名过期（直链里的 `at_` 是签发时间，一般只给几分钟）+ 拿到的是 HTML 错误页。v1.1.2 起会用 `GM_xhr` 校验 Content-Type，见 HTML 就判失败、重取直链重试，不会再存成 `.htm` |
 | 全部 `网络错误` | 页面 CSP 或网络拦截了 `fetch`，可先关掉其它同类脚本再试 |
 
 「诊断」通过但批量仍失败时，多半是短时间请求太密被限流——把 `CFG.parallel` 调到 1、`statusDelay` 调到 500 再试。
+
+> **为什么 F12 里看到的是 `.pdf`？** 超星预览是**服务端把 pptx 转码成 PDF/图片**给播放器用的，网络面板里那一串 `.pdf` / 图片是转码产物。原文件类型看课件信息里的 `suffix`（如 `pptx`），`status` 返回的直链拿到的才是原始文件。
 
 ## 已知限制
 

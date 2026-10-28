@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星/学习通 课程 PPT 批量导出
 // @namespace    https://local.reasonix/chaoxing-ppt-export
-// @version      1.1.1
+// @version      1.1.2
 // @description  一键扫描当前课程所有章节的课件（PPT/PDF/Word 等），批量下载原文件。适用超星 mooc1 学生学习页面。
 // @author       大肥鱼
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -252,22 +252,30 @@
   }
 
   /* ============================ 下载 ============================ */
-  // 取原文件直链：/ananas/status/{objectid}?flag=normal（返回 {status:"success",download:"…",filename:"…"}）
-  // 多试几种参数组合，失败时把每一步的响应片段带在 err.trace 里，方便诊断
+  // 直链里的 at_ 是签发时间戳（毫秒），超星的签名一般只给几分钟
+  function atTime(url) {
+    const m = String(url || '').match(/[?&]at_=(\d{10,13})/);
+    if (!m) return 0;
+    let n = Number(m[1]);
+    if (m[1].length <= 10) n *= 1000;
+    return n;
+  }
+
+  // 取原文件直链：/ananas/status/{objectid}?flag=normal（返回 {"download":"…","filename":"…"}）
+  // 多个参数组合都试；按 at_ 挑“最新签发”的那条（旧签名会 403），全部失败时把每一步响应片段带在 err.trace 里
   async function ananasStatus(objectid, verbose) {
     const bases = Array.from(new Set([location.origin, 'https://mooc1.chaoxing.com']));
-    const paths = [
-      '/ananas/status/' + objectid + '?flag=normal',
-      '/ananas/status/' + objectid + '?download=1&flag=normal',
-      '/mooc-ans/ananas/status/' + objectid + '?flag=normal',
-    ];
-    if (st.fid) paths.splice(1, 0, '/ananas/status/' + objectid + '?k=' + st.fid + '&flag=normal');
+    const paths = ['/ananas/status/' + objectid + '?flag=normal'];
+    if (st.fid) paths.push('/ananas/status/' + objectid + '?k=' + st.fid + '&flag=normal');
+    paths.push('/mooc-ans/ananas/status/' + objectid + '?flag=normal');
 
     const trace = [];
+    const found = [];
     for (const b of bases) {
       for (const p of paths) {
+        // _t 破缓存：服务端会把旧签名缓存住，直接复用就会 403
+        const url = b + p + '&_t=' + Date.now();
         let res;
-        const url = b + p;
         try {
           res = await fetch(url, {
             credentials: 'include',
@@ -281,15 +289,33 @@
         const t = await res.text();
         if (t.length > 4000000) { trace.push('响应过大 ' + url); continue; }
         const download = pickField(t, 'download') || pickField(t, 'downloadUrl') || pickField(t, 'url');
-        const status = pickField(t, 'status');
-        const filename = pickField(t, 'filename');
-        if (download) {
-          const f = t.match(/"fid"\s*:\s*"?(\d{2,8})"?/);
-          if (f && !st.fid) st.fid = f[1];
-          return { status: status || 'success', download: normalizeUrl(download), filename };
+        if (!download) {
+          const status = pickField(t, 'status');
+          trace.push('无 download 字段（status=' + (status || '无') + '） ' + url + ' ← ' + t.slice(0, 160).replace(/\s+/g, ' '));
+          continue;
         }
-        trace.push('无 download 字段（status=' + (status || '无') + '） ' + url + ' ← ' + t.slice(0, 160).replace(/\s+/g, ' '));
+        const f = t.match(/"fid"\s*:\s*"?(\d{2,8})"?/);
+        if (f && !st.fid) st.fid = f[1];
+        const durl = normalizeUrl(download);
+        const at = atTime(durl);
+        found.push({
+          status: pickField(t, 'status') || 'success',
+          download: durl,
+          filename: pickField(t, 'filename'),
+          at: at,
+          age: at ? Date.now() - at : 0,
+        });
       }
+      if (found.some((x) => !x.at || x.age < 60000)) break;   // 已有新鲜签名，不用再换域名
+    }
+
+    if (found.length) {
+      found.sort((x, y) => y.at - x.at);                       // 取最新签发的那条
+      const best = found[0];
+      if (verbose) console.warn('[超星PPT导出] status 候选：', found.map((x) => Math.round(x.age / 1000) + 's ' + x.download));
+      if (best.at && best.age > 120000) trace.push('⚠ 直链签名已 ' + Math.round(best.age / 1000) + ' 秒，可能过期');
+      best.trace = trace;
+      return best;
     }
     const err = new Error(trace.length ? trace[trace.length - 1] : '取下载地址失败');
     err.trace = trace;
@@ -325,39 +351,66 @@
     });
   }
 
-  // 二级：GM_xmlhttpRequest 取 blob 再落盘（绕开 CORS / 白名单限制）
-  function gmXhrDownload(url, name) {
+  // 取二进制（GM_xhr 不受 CORS 限制，能拿到 403 页并检查 Content-Type）
+  function xhrBlob(url) {
     return new Promise((resolve) => {
-      if (typeof GM_xmlhttpRequest !== 'function') return resolve('err:无 GM_xmlhttpRequest');
-      const before = (r) => {
-        if (r.status !== 200 || !r.response) return resolve('err:HTTP ' + r.status);
-        const blobUrl = URL.createObjectURL(r.response);
-        const a = el('a', { href: blobUrl, download: name, style: 'display:none' });
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-        resolve('ok');
-      };
+      if (typeof GM_xmlhttpRequest !== 'function') return resolve({ ok: false, error: '无 GM_xmlhttpRequest' });
       const opts = {
         method: 'GET',
         url: url,
         responseType: 'blob',
         timeout: 120000,
-        onload: before,
-        onerror: () => resolve('err:xhr 请求失败'),
-        ontimeout: () => resolve('err:xhr 超时'),
+        onload: (r) => resolve({
+          ok: r.status === 200 && !!r.response,
+          status: r.status,
+          blob: r.response,
+          type: (r.response && r.response.type) || '',
+        }),
+        onerror: () => resolve({ ok: false, error: 'xhr 失败' }),
+        ontimeout: () => resolve({ ok: false, error: 'xhr 超时' }),
       };
       try {
         GM_xmlhttpRequest({ ...opts, headers: { Referer: location.href } });
       } catch (e) {
         // 个别管理器不允许设置 Referer，去掉再试一次
-        try { GM_xmlhttpRequest(opts); } catch (e2) { resolve('err:' + e2.message); }
+        try { GM_xmlhttpRequest(opts); } catch (e2) { resolve({ ok: false, error: e2.message }); }
       }
     });
   }
 
-  // 三级：直接 a[download]（最朴素，跨域时 download 属性可能被忽略，只算“已发起”）
+  function saveBlob(blob, name) {
+    const blobUrl = URL.createObjectURL(blob);
+    const a = el('a', { href: blobUrl, download: name, style: 'display:none' });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+  }
+
+  // 一级：GM_xhr 直取 + 校验（403 页/HTML 会被识别出来，不会存成 .htm）
+  async function downloadVerified(info, name, att) {
+    const u = info.download;
+    const urls = [u];
+    if (/^https:/i.test(u)) urls.push('http:' + u.slice(6));     // 签名可能只对原 scheme 有效
+    else if (/^http:/i.test(u)) urls.push('https:' + u.slice(5));
+
+    const fails = [];
+    for (const url of urls) {
+      const r = await xhrBlob(url);
+      if (!r.ok) { fails.push((url.startsWith('https') ? 'https' : 'http') + ' → ' + (r.error || ('HTTP ' + r.status))); continue; }
+      const size = (r.blob && r.blob.size) || 0;
+      if (/text\/html|application\/(xhtml|xml)/i.test(r.type)) { fails.push('返回的是 HTML 错误页（签名过期/防盗链）'); continue; }
+      if (size < 1024) { fails.push('内容过小 ' + size + 'B'); continue; }
+      if (att && att.size && Math.abs(size - att.size) > 4096) {
+        logLine('   ⚠ 大小与课件信息不符：' + size + ' ≠ ' + att.size + '（仍然保存）');
+      }
+      saveBlob(r.blob, name);
+      return 'GM_xhr(' + (url.startsWith('https') ? 'https' : 'http') + ')';
+    }
+    throw new Error(fails.join('；'));
+  }
+
+  // 三级：直接 a[download]（跨域时 download 属性可能被忽略，只算“已发起”）
   function anchorDownload(url, name) {
     try {
       const a = el('a', { href: url, download: name, target: '_blank', style: 'display:none' });
@@ -368,19 +421,17 @@
     } catch (e) { return 'err:' + e.message; }
   }
 
-  // 依次降级，返回实际生效的方式；全挂才抛错
-  async function saveFile(url, name) {
-    const fails = [];
-    let r = await gmDownload(url, name);
-    if (r === 'ok') return 'GM_download';
-    fails.push('GM_download → ' + r);
-    r = await gmXhrDownload(url, name);
-    if (r === 'ok') return 'GM_xhr';
-    fails.push('GM_xhr → ' + r);
-    r = anchorDownload(url, name);
-    if (r === 'weak') return 'anchor(未确认)';
-    fails.push('链接跳转 → ' + r);
-    throw new Error(fails.join('；'));
+  // 一级 GM_xhr 校验下载 → 二级 GM_download → 三级 a[download]
+  async function saveFile(info, name, att) {
+    try { return await downloadVerified(info, name, att); }
+    catch (e) {
+      const why = e.message || String(e);
+      const r = await gmDownload(info.download, name);
+      if (r === 'ok') return 'GM_download（直取失败：' + why + '）';
+      const w = anchorDownload(info.download, name);
+      if (w === 'weak') return 'anchor(未确认)';
+      throw new Error(why + '；GM_download → ' + r);
+    }
   }
 
   /* ============================ 界面 ============================ */
@@ -736,9 +787,17 @@
         done++;
         setStatus(`下载 ${done}/${items.length}：${it.att.name || it.att.objectid}`);
         try {
-          const info = await ananasStatus(it.att.objectid);
-          const name = buildFileName(it.ch, it.att, info.filename);
-          const via = await saveFile(info.download, name);
+          let info = await ananasStatus(it.att.objectid);
+          let via;
+          try {
+            via = await saveFile(info, buildFileName(it.ch, it.att, info.filename), it.att);
+          } catch (e1) {
+            // 签名过期/被缓存住时，重新取一次直链再试
+            logLine(`↻ ${it.att.name || it.att.objectid} 首次失败（${e1.message}），重取直链重试`);
+            await sleep(400);
+            info = await ananasStatus(it.att.objectid);
+            via = await saveFile(info, buildFileName(it.ch, it.att, info.filename), it.att);
+          }
           if (via.startsWith('anchor')) weak++; else ok++;
           st.downloaded.add(it.att.objectid);
           markItem(it.att.objectid, 'ok', via);
@@ -793,8 +852,8 @@
     logLine('objectid: ' + att.objectid + '   fid: ' + (st.fid || '未取到') + '   页面: ' + location.href);
     try {
       const info = await ananasStatus(att.objectid, true);
-      logLine('✓ status 正常，直链：' + info.download);
-      const via = await saveFile(info.download, '诊断_' + (att.name || att.objectid));
+      logLine('✓ status 正常，直链签发于 ' + (info.at ? Math.round(info.age / 1000) + ' 秒前' : '未知') + '：' + info.download);
+      const via = await saveFile(info, '诊断_' + (att.name || att.objectid), att);
       logLine('✓ 保存方式：' + via);
       setStatus('诊断通过：接口和下载都正常');
     } catch (e) {
@@ -827,7 +886,7 @@
 
   // 调试用：在控制台写 window.__CXPPT_DEBUG__ = true 后刷新，可拿到内部函数自测
   if (window.__CXPPT_DEBUG__) {
-    window.__cxpptInternals = { collectAttachments, cardsUrl, pickField, readChapters, normalizeUrl, buildFileName, st };
+    window.__cxpptInternals = { collectAttachments, cardsUrl, pickField, readChapters, normalizeUrl, buildFileName, atTime, st };
   }
 
   // 章节树可能是异步渲染的，轮询等它出现
