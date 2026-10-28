@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星/学习通 课程 PPT 批量导出
 // @namespace    https://local.reasonix/chaoxing-ppt-export
-// @version      1.1.0
+// @version      1.1.1
 // @description  一键扫描当前课程所有章节的课件（PPT/PDF/Word 等），批量下载原文件。适用超星 mooc1 学生学习页面。
 // @author       大肥鱼
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -73,9 +73,10 @@
     return fixProtocol(u);
   }
 
-  // 从超星那种“类 JS 对象”文本里取字符串字段（key 可能带引号也可能不带）
+  // 从超星那种“类 JS 对象”文本里取字符串字段
+  // 兼容 {"download":"…"} 和 {status:"success"} 两种写法（key 带不带引号都行）
   function pickField(text, key) {
-    const re = new RegExp('[{,]\\s*' + key + '\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"');
+    const re = new RegExp('(?:^|[{,])\\s*"?' + key + '"?\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"');
     const m = text.match(re);
     if (!m) return '';
     try { return JSON.parse('"' + m[1] + '"'); } catch (e) { return m[1]; }
@@ -254,7 +255,7 @@
   // 取原文件直链：/ananas/status/{objectid}?flag=normal（返回 {status:"success",download:"…",filename:"…"}）
   // 多试几种参数组合，失败时把每一步的响应片段带在 err.trace 里，方便诊断
   async function ananasStatus(objectid, verbose) {
-    const bases = Array.from(new Set([location.origin, 'https://mooc1.chaoxing.com', 'https://mooc2-ans.chaoxing.com']));
+    const bases = Array.from(new Set([location.origin, 'https://mooc1.chaoxing.com']));
     const paths = [
       '/ananas/status/' + objectid + '?flag=normal',
       '/ananas/status/' + objectid + '?download=1&flag=normal',
@@ -287,7 +288,7 @@
           if (f && !st.fid) st.fid = f[1];
           return { status: status || 'success', download: normalizeUrl(download), filename };
         }
-        trace.push('status=' + (status || '空') + ' ' + url + ' ← ' + t.slice(0, 160).replace(/\s+/g, ' '));
+        trace.push('无 download 字段（status=' + (status || '无') + '） ' + url + ' ← ' + t.slice(0, 160).replace(/\s+/g, ' '));
       }
     }
     const err = new Error(trace.length ? trace[trace.length - 1] : '取下载地址失败');
@@ -328,27 +329,31 @@
   function gmXhrDownload(url, name) {
     return new Promise((resolve) => {
       if (typeof GM_xmlhttpRequest !== 'function') return resolve('err:无 GM_xmlhttpRequest');
+      const before = (r) => {
+        if (r.status !== 200 || !r.response) return resolve('err:HTTP ' + r.status);
+        const blobUrl = URL.createObjectURL(r.response);
+        const a = el('a', { href: blobUrl, download: name, style: 'display:none' });
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+        resolve('ok');
+      };
+      const opts = {
+        method: 'GET',
+        url: url,
+        responseType: 'blob',
+        timeout: 120000,
+        onload: before,
+        onerror: () => resolve('err:xhr 请求失败'),
+        ontimeout: () => resolve('err:xhr 超时'),
+      };
       try {
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url: url,
-          responseType: 'blob',
-          timeout: 120000,
-          headers: { Referer: location.href },
-          onload: (r) => {
-            if (r.status !== 200 || !r.response) return resolve('err:HTTP ' + r.status);
-            const blobUrl = URL.createObjectURL(r.response);
-            const a = el('a', { href: blobUrl, download: name, style: 'display:none' });
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-            resolve('ok');
-          },
-          onerror: () => resolve('err:xhr 请求失败'),
-          ontimeout: () => resolve('err:xhr 超时'),
-        });
-      } catch (e) { resolve('err:' + e.message); }
+        GM_xmlhttpRequest({ ...opts, headers: { Referer: location.href } });
+      } catch (e) {
+        // 个别管理器不允许设置 Referer，去掉再试一次
+        try { GM_xmlhttpRequest(opts); } catch (e2) { resolve('err:' + e2.message); }
+      }
     });
   }
 

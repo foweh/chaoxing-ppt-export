@@ -63,6 +63,15 @@ console.log('status ->', api.pickField(statusText, 'status'), '|', api.pickField
 if (api.pickField(statusText, 'status') !== 'success') { console.error('FAIL: status 解析'); process.exit(1); }
 if (api.pickField(statusText, 'download') !== 'http://p.ananas.chaoxing.com/star3/origin/abc.pptx?x=1') { console.error('FAIL: download 解析'); process.exit(1); }
 
+// 3b. 线上真实返回（key 带引号、没有 status 字段）—— 这就是导致“全部失败”的那条
+const real = '{"download":"http://d0.cldisk.com/download/83546a23f511fb768aa590480b6000c3?at_=1793166868274&ak=c9ad&ad=109f","length":710673,"filename":"第10讲.pptx"}';
+const realDl = api.pickField(real, 'download');
+console.log('real download ->', realDl);
+if (realDl !== 'http://d0.cldisk.com/download/83546a23f511fb768aa590480b6000c3?at_=1793166868274&ak=c9ad&ad=109f') {
+  console.error('FAIL: 带引号 key 的 download 解析'); process.exit(1);
+}
+if (api.pickField(real, 'filename') !== '第10讲.pptx') { console.error('FAIL: 带引号 key 的 filename 解析'); process.exit(1); }
+
 // 4. 校验 cardsUrl
 api.st.params = { courseId: '268592729', clazzId: '158343203', cpi: '410093475' };
 console.log('cardsUrl ->', api.cardsUrl('/mooc-ans', '1273611702', 0));
