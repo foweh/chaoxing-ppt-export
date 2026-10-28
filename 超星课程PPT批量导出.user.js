@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         超星/学习通 课程 PPT 批量导出
 // @namespace    https://local.reasonix/chaoxing-ppt-export
-// @version      1.1.2
+// @version      1.1.3
 // @description  一键扫描当前课程所有章节的课件（PPT/PDF/Word 等），批量下载原文件。适用超星 mooc1 学生学习页面。
 // @author       大肥鱼
 // @match        *://mooc1.chaoxing.com/mycourse/studentstudy*
@@ -22,9 +22,9 @@
 
   /* ============================ 可调参数 ============================ */
   const CFG = {
-    parallel: 3,            // 同时下载的文件数（别开太大，超星会限流）
+    parallel: 1,            // 同时下载的文件数；超星 CDN 对并发很敏感，默认 1（顺序下最稳）
     chapterDelay: 250,      // 每扫完一章后的停顿(ms)
-    statusDelay: 150,       // 每次取下载地址之间的停顿(ms)
+    statusDelay: 300,       // 两次下载之间的停顿(ms)
     retry: 2,               // 单个请求失败重试次数
     cacheKey: 'cxppt:v1',   // localStorage 缓存前缀
   };
@@ -593,7 +593,7 @@
     const btnDownload = el('button', { class: 'cxp-btn cxp-primary', text: '下载选中（0）' });
     const btnCopy = el('button', { class: 'cxp-btn', text: '复制清单' });
     const btnJson = el('button', { class: 'cxp-btn', text: '导出清单' });
-    const btnDiag = el('button', { class: 'cxp-btn', text: '诊断' });
+    const btnDiag = el('button', { class: 'cxp-btn', text: '逐个下载', title: '单线程逐个下载并逐个校验（原来叫“诊断”）' });
     const btnClear = el('button', { class: 'cxp-btn', text: '重置下载记录' });
     bar2.append(btnDownload, btnCopy, btnJson, btnDiag, btnClear);
 
@@ -770,8 +770,10 @@
     saveCache();
   }
 
-  async function runDownloads() {
+  async function runDownloads(opts) {
     if (st.busy) return;
+    const sequential = !!(opts && opts.sequential);
+    const verbose = !!(opts && opts.verbose);
     const items = selectedItems();
     if (!items.length) { toast('没有选中任何文件'); return; }
 
@@ -780,14 +782,15 @@
     refreshSummary();
     const queue = items.slice();
     let done = 0, ok = 0, weak = 0, fail = 0;
+    const label = sequential ? '逐个下载' : '下载';
 
     const worker = async () => {
       while (queue.length) {
         const it = queue.shift();
         done++;
-        setStatus(`下载 ${done}/${items.length}：${it.att.name || it.att.objectid}`);
+        setStatus(`${label} ${done}/${items.length}：${it.att.name || it.att.objectid}`);
         try {
-          let info = await ananasStatus(it.att.objectid);
+          let info = await ananasStatus(it.att.objectid, verbose);
           let via;
           try {
             via = await saveFile(info, buildFileName(it.ch, it.att, info.filename), it.att);
@@ -814,11 +817,11 @@
       }
     };
 
-    await Promise.all(Array.from({ length: Math.max(1, CFG.parallel) }, worker));
+    await Promise.all(Array.from({ length: sequential ? 1 : Math.max(1, CFG.parallel) }, worker));
     st.busy = false;
     refreshSummary();
-    setStatus(`下载结束：成功 ${ok}${weak ? `（另有 ${weak} 个仅发起、未确认）` : ''}，失败 ${fail}`);
-    if (fail) logLine(`有 ${fail} 个失败，点「诊断」看详细原因，或点每行 ↗ 手动下载`);
+    setStatus(`${label}结束：成功 ${ok}${weak ? `（另有 ${weak} 个仅发起、未确认）` : ''}，失败 ${fail}`);
+    if (fail) logLine(`有 ${fail} 个失败，点「逐个下载」重试，或点每行 ↗ 手动下载`);
   }
 
   function markItem(oid, cls, msg) {
@@ -836,32 +839,20 @@
     }
   }
 
-  // 诊断：对第一个选中（或第一个）附件跑一遍“取直链 + 下载”，把每一步结果摊开
+  // 「逐个下载」：单线程跑选中的文件，每一步都校验内容（原「诊断」，现在也是真下载）
   async function diagnose() {
-    const sel = selectedItems();
-    let att = sel.length ? sel[0].att : null;
-    if (!att) {
+    if (st.busy) return;
+    if (!selectedItems().length) {
+      let first = null;
       for (const ch of st.chapters) {
-        if ((ch.attachments || []).length) { att = ch.attachments[0]; break; }
+        if ((ch.attachments || []).length) { first = { ch, att: ch.attachments[0] }; break; }
       }
+      if (!first) { logLine('先「扫描全部章节」，再点逐个下载'); return; }
+      st.selected.add(first.att.objectid);
+      renderList();
     }
-    if (!att) { logLine('先「扫描全部章节」，再点诊断'); return; }
-
-    setStatus('诊断中…');
-    logLine('—— 诊断开始 ——');
-    logLine('objectid: ' + att.objectid + '   fid: ' + (st.fid || '未取到') + '   页面: ' + location.href);
-    try {
-      const info = await ananasStatus(att.objectid, true);
-      logLine('✓ status 正常，直链签发于 ' + (info.at ? Math.round(info.age / 1000) + ' 秒前' : '未知') + '：' + info.download);
-      const via = await saveFile(info, '诊断_' + (att.name || att.objectid), att);
-      logLine('✓ 保存方式：' + via);
-      setStatus('诊断通过：接口和下载都正常');
-    } catch (e) {
-      logLine('✗ ' + (e.message || String(e)));
-      (e.trace || []).forEach((l) => logLine('   ' + l));
-      console.warn('[超星PPT导出] 诊断失败', e);
-      setStatus('诊断失败，详情见下方日志');
-    }
+    logLine('—— 逐个下载开始（单线程、逐个校验内容，不会再存出 403 的 .htm）——');
+    await runDownloads({ sequential: true, verbose: true });
     copyText(ui.log.textContent);
   }
 
